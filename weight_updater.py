@@ -13,7 +13,6 @@ import json
 from utils.datautils import prepare_train_loaders
 from modules.IncrementalPCA import IncrementalPCAonGPU
 from modules.module import SVDTransformLayer, ProjectedLinear
-from modules.remapping import DOBI_quantize
 
 
 
@@ -292,6 +291,7 @@ def main(args):
         torch.save({'model': model, 'tokenizer': tokenizer}, output_save_path)
         
     if args.remapping:
+        from modules.remapping import DOBI_quantize
         mapping_info = {}
         for name, module in tqdm(model.named_modules(), desc="Remapping weights"):
             if isinstance(module, nn.Linear) and all(x not in name for x in ['lm_head']):

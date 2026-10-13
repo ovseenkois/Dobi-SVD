@@ -14,7 +14,6 @@ import logging
 
 from utils.datautils import prepare_train_loaders
 from modules.module import *
-from modules.remapping import DOBI_dequantize
 from modelutils import load_remapping_model, load_unremapping_model
 
 def evaluate_perplexity(model, dataset, limit):

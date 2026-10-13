@@ -2,14 +2,7 @@ import argparse
 import os
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-from torch.optim import Adam
-import torch.distributions as dist
-from transformers import Trainer
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-from transformers import AutoModelForSequenceClassification
-from transformers import DataCollatorForLanguageModeling
-from accelerate import Accelerator
 import numpy as np
 import math
 import random
@@ -17,7 +10,6 @@ from tqdm import tqdm
 from pathlib import Path
 import gc
 import json    
-from datetime import datetime
 import logging
 
 from utils.datautils import prepare_train_loaders

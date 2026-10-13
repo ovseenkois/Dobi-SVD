@@ -22,7 +22,7 @@ import time
 
 from utils.datautils import prepare_train_loaders
 from modules.IncrementalPCA import IncrementalPCAonGPU
-from modules.module import SVDTransformLayer
+from modules.module import SVDTransformLayer, ProjectedLinear
 from modules.remapping import DOBI_quantize
 
 
@@ -53,44 +53,56 @@ def main(args):
     dataset_cache_dir.mkdir(parents=True, exist_ok=True)
     assert dataset_cache_dir.exists() is True
     output_dir = path_head_folder_output / 'training_output' / lower_id
-    assert output_dir.exists() is True
+    if args.fixed_rank_ratio is None:
+        assert output_dir.exists() is True
     save_dir = path_head_folder_output / 'compressed_model' / lower_id
     save_dir.mkdir(parents=True, exist_ok=True)
 
     
     
 
-    TA_tarined_model_output_dir = output_dir / args.training_result_path
-    para_json = TA_tarined_model_output_dir /'para_config.json'
-    with open(para_json, 'r') as file:
-        para_data = json.load(file)
+    if args.fixed_rank_ratio is not None:
+        if args.weight_update != 'gram':
+            raise ValueError('--fixed_rank_ratio is only supported with --weight_update gram')
+        if not 0 < args.fixed_rank_ratio <= 1:
+            raise ValueError('--fixed_rank_ratio must be in (0, 1]')
+        para_data = None
+    else:
+        if not args.training_result_path:
+            raise ValueError('Provide --training_result_path or --fixed_rank_ratio')
+        TA_tarined_model_output_dir = output_dir / args.training_result_path
+        with open(TA_tarined_model_output_dir / 'para_config.json', 'r') as file:
+            para_data = json.load(file)
         
     # for model
-    model_load_dtype = para_data['dtype_settings']['model_load_dtype']
+    model_load_dtype = (para_data['dtype_settings']['model_load_dtype']
+                        if para_data else torch.float16)
     if model_load_dtype == 'f16':
         model_load_dtype = torch.float16
-    computeSVD_dtype = para_data['dtype_settings']['computeSVD_dtype']
+    computeSVD_dtype = (para_data['dtype_settings']['computeSVD_dtype']
+                        if para_data else torch.float32)
     if computeSVD_dtype == 'f32':
         computeSVD_dtype = torch.float32
     use_safetensors = False
     
     # for dataset
-    NSAMPLES_train = para_data['dataset_processing']['NSAMPLES_train']
-    SEQ_LEN = para_data['dataset_processing']['SEQ_LEN']
-    NSAMPLES_val = para_data['dataset_processing']['NSAMPLES_val']
-    target_compression_ratio = para_data["target_compression_ratio"]
+    NSAMPLES_train = para_data['dataset_processing']['NSAMPLES_train'] if para_data else args.n_train_samples
+    SEQ_LEN = para_data['dataset_processing']['SEQ_LEN'] if para_data else args.seq_len
+    NSAMPLES_val = para_data['dataset_processing']['NSAMPLES_val'] if para_data else args.n_eval_samples
+    target_compression_ratio = para_data["target_compression_ratio"] if para_data else args.fixed_rank_ratio
     SAVE = args.SAVE
     RECREATE = args.RECREATE
-    BETA = para_data['BETA']
+    BETA = para_data['BETA'] if para_data else 10
 
     args.seq_len = SEQ_LEN
     
+    method_prefix = 'DobiGram' if args.weight_update == 'gram' else 'DobiSVD'
     if not args.remapping: 
-        output_dir = save_dir/ f"DobiSVD_Noremapping-{lower_id}-{target_compression_ratio}"
+        output_dir = save_dir/ f"{method_prefix}_Noremapping-{lower_id}-{target_compression_ratio}"
         output_dir.mkdir(parents=True, exist_ok=True)
         output_save_path = str(output_dir) + "/" + "DobiSVD_Model.pt"
     if args.remapping: 
-        output_dir = save_dir/ f"DobiSVD-{lower_id}-{target_compression_ratio}"
+        output_dir = save_dir/ f"{method_prefix}-{lower_id}-{target_compression_ratio}"
         output_dir.mkdir(parents=True, exist_ok=True)
         output_save_path = str(output_dir) + "/" + "remapping_weight.pt"
     print("The compressed model will be saved in", output_save_path)
@@ -109,124 +121,160 @@ def main(args):
     model.to(DEV_GPU)
     
     # load json
-    gamma_json_file = TA_tarined_model_output_dir / 'best_gamma.json'
-    with open(gamma_json_file, 'r') as file:
-        gamma_json = json.load(file)
+    if para_data:
+        gamma_json_file = TA_tarined_model_output_dir / 'best_gamma.json'
+        with open(gamma_json_file, 'r') as file:
+            gamma_json = json.load(file)
+    else:
+        gamma_json = None
 
 
     # prepared dataset
     tokenized_traindata, tokenized_valdata = prepare_train_loaders(tokenizer, DATASET_NAME, data_cache_dir, dataset_cache_dir, args)
 
     
-    V_PCA_dict = {}
-    PCA_tensor_dict = {}
-    V_accu_list_dict = {}
+    if args.weight_update == 'gram':
+        from modules.gram_update import collect_gram_matrices, gram_project_weight
 
-
-    def process_batch(ipca,A,name): 
-        ipca.partial_fit(A)
-        principal_components = ipca.components_
-        principal_components_tensor = torch.tensor(principal_components, device=A.device)
-        PCA_tensor_dict[name] = principal_components_tensor.to(DEV_CPU)
-        del principal_components_tensor
-        del A
-        del principal_components
-    
-    
-    def svd_forward(self, x):
-        # print('--------------',self.name,'-----------')
-        if x.dim() == 3:
-            x = x.squeeze(0)
-        assert x.dim() == 2
-        W_T = self.weight.to(computeSVD_dtype).T
-        A = x.to(computeSVD_dtype) @ W_T
-        
-        gamma_range = math.ceil(self.gamma)
-        real_gamma = min(A.shape[0], A.shape[1], max(1, gamma_range))
-        Uf, Sf, Vf = torch.svd_lowrank(A, q=int(real_gamma), niter = 2)
-        
-        sequence = torch.arange(1, len(Sf)+1, device = A.device, dtype = A.dtype)
-        Trunc = (0.5*torch.tanh(self.BETA * (real_gamma - sequence))+0.5)
-        S_transformed = Sf*Trunc
-        S_diag = torch.diag_embed(S_transformed)
-        x_transformed = Uf @ S_diag @Vf.T
-        x_transformed = x_transformed.to(model_load_dtype)
-
-        # Use IPCA to Collect representive V_f
-        Vf1=Vf.detach().to(DEV_CPU)
-        V_accu_list_dict[self.name].append(Vf1)
-        if len(V_accu_list_dict[self.name])==self.Ngamma:
-            Vf_full = torch.concatenate(V_accu_list_dict[self.name][:self.Ngamma], axis=1).to(DEV_GPU)
-            process_batch(V_PCA_dict[self.name], Vf_full.T, self.name)
-            V_accu_list_dict[self.name]=[]
-            del Vf_full
-            gc.collect()
-            torch.cuda.empty_cache()
-            
-        return x_transformed
-    
-    
-    # Collect V_A by using IPCA
-    for name, module in tqdm(model.named_modules(), desc="Add SVD attribute to modules"):
-        if isinstance(module, nn.Linear) and all(x not in name for x in model_no_svd_layer_dic[lower_id]):
-            gamma = torch.tensor(gamma_json[name], dtype=computeSVD_dtype)
-            module.forward = svd_forward.__get__(module, nn.Linear)
-            module.register_buffer('gamma', gamma)
-            module.register_buffer('BETA', torch.tensor(BETA))
-            m,n =module.weight.shape
-            
-            cut = min(module.in_features, module.out_features)/SEQ_LEN
-            module.Ngamma = int(cut)
-            if cut>1:
-                real_gamma = min(m,n, max(1,cut*math.ceil(gamma)))
+        def rank_for_layer(name, module):
+            m, n = module.weight.shape
+            if gamma_json is None:
+                effective_rank = (args.fixed_rank_ratio * min(m, n) if args.remapping
+                                  else args.fixed_rank_ratio * m * n / (m + n))
             else:
-                real_gamma = min(m,n, max(1,math.ceil(gamma)))
-            # print(real_gamma)
-            V_PCA_dict[name] = IncrementalPCAonGPU(n_components=int(real_gamma))
-            V_accu_list_dict[name] = []
-            module.name = name
-            
-    model.to(DEV_GPU)
+                cut = min(m, n) / SEQ_LEN
+                effective_rank = float(gamma_json[name]) * max(1.0, cut)
+            return max(1, min(m, n, math.ceil(effective_rank)))
 
-    for name, param in model.named_parameters():
-        param.requires_grad = False
+        names = [name for name, module in model.named_modules()
+                 if isinstance(module, nn.Linear)
+                 and all(excluded not in name for excluded in model_no_svd_layer_dic[lower_id])]
+        gram_matrices = collect_gram_matrices(model, names, tokenized_traindata, DEV_GPU)
+        del model
+        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=model_load_dtype)
+        model.to(DEV_GPU)
+        for name, module in tqdm(model.named_modules(), desc='Project weights with Gram eigenvectors'):
+            if name not in gram_matrices:
+                continue
+            k = rank_for_layer(name, module)
+            basis, projected = gram_project_weight(gram_matrices.pop(name), module.weight.data, k)
+            module.weight.data = projected.to(module.weight.dtype)
+            module.register_buffer('_gram_basis', basis.to(module.weight.dtype), persistent=False)
+            del basis, projected
+        # Continue with the existing serialization paths below.
+    else:
+        gram_matrices = None
 
-    # weight updating
-    for batch in tqdm(tokenized_traindata):
-        # cnt += 1
-        batch = {k: v.to(DEV_GPU).unsqueeze(0) for k, v in batch.items()}
-        with torch.no_grad():
-            model(**batch)
+    if args.weight_update == 'ipca':
+        V_PCA_dict = {}
+        PCA_tensor_dict = {}
+        V_accu_list_dict = {}
 
+
+        def process_batch(ipca,A,name):
+            ipca.partial_fit(A)
+            principal_components = ipca.components_
+            principal_components_tensor = torch.tensor(principal_components, device=A.device)
+            PCA_tensor_dict[name] = principal_components_tensor.to(DEV_CPU)
+            del principal_components_tensor
+            del A
+            del principal_components
     
-    def change_weight(gamma, W, name):
-        W = W.to(computeSVD_dtype)
-        principal_components_tensor = PCA_tensor_dict[name]
-        V_pca =principal_components_tensor.T.cuda().to(computeSVD_dtype)
-        sequence = torch.arange(1, V_pca.shape[1]+1).to(DEV_GPU)
-        m,n =W.shape
-        real_gamma = min(m,n, max(1, gamma))
-        Trunc = (0.5*torch.tanh(BETA * (real_gamma - sequence))+0.5)
+    
+        def svd_forward(self, x):
+            # print('--------------',self.name,'-----------')
+            if x.dim() == 3:
+                x = x.squeeze(0)
+            assert x.dim() == 2
+            W_T = self.weight.to(computeSVD_dtype).T
+            A = x.to(computeSVD_dtype) @ W_T
         
-        G=torch.diag(Trunc)
-        W_new = (W.T @ V_pca @ G @V_pca.T).T
-        W_new = W_new.to(model_load_dtype)
-        return W_new
+            gamma_range = math.ceil(self.gamma)
+            real_gamma = min(A.shape[0], A.shape[1], max(1, gamma_range))
+            Uf, Sf, Vf = torch.svd_lowrank(A, q=int(real_gamma), niter = 2)
+        
+            sequence = torch.arange(1, len(Sf)+1, device = A.device, dtype = A.dtype)
+            Trunc = (0.5*torch.tanh(self.BETA * (real_gamma - sequence))+0.5)
+            S_transformed = Sf*Trunc
+            S_diag = torch.diag_embed(S_transformed)
+            x_transformed = Uf @ S_diag @Vf.T
+            x_transformed = x_transformed.to(model_load_dtype)
+
+            # Use IPCA to Collect representive V_f
+            Vf1=Vf.detach().to(DEV_CPU)
+            V_accu_list_dict[self.name].append(Vf1)
+            if len(V_accu_list_dict[self.name])==self.Ngamma:
+                Vf_full = torch.concatenate(V_accu_list_dict[self.name][:self.Ngamma], axis=1).to(DEV_GPU)
+                process_batch(V_PCA_dict[self.name], Vf_full.T, self.name)
+                V_accu_list_dict[self.name]=[]
+                del Vf_full
+                gc.collect()
+                torch.cuda.empty_cache()
+            
+            return x_transformed
     
-    del model
-    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=model_load_dtype)
-    model.to(DEV_GPU)
-    for name, module in tqdm(model.named_modules(), desc="Update model weight"):
-        if isinstance(module, nn.Linear) and all(x not in name for x in model_no_svd_layer_dic[lower_id]):
-            cut = min(module.in_features, module.out_features)/SEQ_LEN
-            if cut>1:
-                gamma = cut * torch.tensor(gamma_json[name], dtype=computeSVD_dtype)
-            else:
+    
+        # Collect V_A by using IPCA
+        for name, module in tqdm(model.named_modules(), desc="Add SVD attribute to modules"):
+            if isinstance(module, nn.Linear) and all(x not in name for x in model_no_svd_layer_dic[lower_id]):
                 gamma = torch.tensor(gamma_json[name], dtype=computeSVD_dtype)
-            W=module.weight.data.detach()
-            new_weight = change_weight(gamma, W, name)
-            module.weight.data = new_weight
-            del W
+                module.forward = svd_forward.__get__(module, nn.Linear)
+                module.register_buffer('gamma', gamma)
+                module.register_buffer('BETA', torch.tensor(BETA))
+                m,n =module.weight.shape
+            
+                cut = min(module.in_features, module.out_features)/SEQ_LEN
+                module.Ngamma = int(cut)
+                if cut>1:
+                    real_gamma = min(m,n, max(1,cut*math.ceil(gamma)))
+                else:
+                    real_gamma = min(m,n, max(1,math.ceil(gamma)))
+                # print(real_gamma)
+                V_PCA_dict[name] = IncrementalPCAonGPU(n_components=int(real_gamma))
+                V_accu_list_dict[name] = []
+                module.name = name
+            
+        model.to(DEV_GPU)
+
+        for name, param in model.named_parameters():
+            param.requires_grad = False
+
+        # weight updating
+        for batch in tqdm(tokenized_traindata):
+            # cnt += 1
+            batch = {k: v.to(DEV_GPU).unsqueeze(0) for k, v in batch.items()}
+            with torch.no_grad():
+                model(**batch)
+
+    
+        def change_weight(gamma, W, name):
+            W = W.to(computeSVD_dtype)
+            principal_components_tensor = PCA_tensor_dict[name]
+            V_pca =principal_components_tensor.T.cuda().to(computeSVD_dtype)
+            sequence = torch.arange(1, V_pca.shape[1]+1).to(DEV_GPU)
+            m,n =W.shape
+            real_gamma = min(m,n, max(1, gamma))
+            Trunc = (0.5*torch.tanh(BETA * (real_gamma - sequence))+0.5)
+        
+            G=torch.diag(Trunc)
+            W_new = (W.T @ V_pca @ G @V_pca.T).T
+            W_new = W_new.to(model_load_dtype)
+            return W_new
+    
+        del model
+        model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=model_load_dtype)
+        model.to(DEV_GPU)
+        for name, module in tqdm(model.named_modules(), desc="Update model weight"):
+            if isinstance(module, nn.Linear) and all(x not in name for x in model_no_svd_layer_dic[lower_id]):
+                cut = min(module.in_features, module.out_features)/SEQ_LEN
+                if cut>1:
+                    gamma = cut * torch.tensor(gamma_json[name], dtype=computeSVD_dtype)
+                else:
+                    gamma = torch.tensor(gamma_json[name], dtype=computeSVD_dtype)
+                W=module.weight.data.detach()
+                new_weight = change_weight(gamma, W, name)
+                module.weight.data = new_weight
+                del W
         
         
     # update and save model
@@ -239,11 +287,14 @@ def main(args):
                     parent = dict(model.named_modules())[parent_name]
                 else:
                     parent = model
-                cut = min(module.in_features, module.out_features)/SEQ_LEN
-                gamma = cut * torch.tensor(gamma_json[name], dtype=computeSVD_dtype)
-                gamma = cut * math.ceil(gamma/cut)
-                NewLayer = SVDTransformLayer(gamma =int(gamma), weight = module.weight.data.detach(), 
-                                             bias = module.bias, name = name, device = model.device)
+                if args.weight_update == 'gram':
+                    NewLayer = ProjectedLinear(module, module._gram_basis, name=name)
+                else:
+                    cut = min(module.in_features, module.out_features)/SEQ_LEN
+                    gamma = cut * torch.tensor(gamma_json[name], dtype=computeSVD_dtype)
+                    gamma = cut * math.ceil(gamma/cut)
+                    NewLayer = SVDTransformLayer(gamma =int(gamma), weight = module.weight.data.detach(),
+                                                 bias = module.bias, name = name, device = model.device)
                 setattr(parent, attr_name, NewLayer)
                 del module
             
@@ -254,11 +305,14 @@ def main(args):
         mapping_info = {}
         for name, module in tqdm(model.named_modules(), desc="Remapping weights"):
             if isinstance(module, nn.Linear) and all(x not in name for x in ['lm_head']):
-                cut = min(module.in_features, module.out_features)/2048
-                if cut>1:
-                    gamma = cut * torch.tensor(gamma_json[name], dtype=computeSVD_dtype)
+                if args.weight_update == 'gram':
+                    gamma = rank_for_layer(name, module)
                 else:
-                    gamma = torch.tensor(gamma_json[name], dtype=computeSVD_dtype)
+                    cut = min(module.in_features, module.out_features)/2048
+                    if cut>1:
+                        gamma = cut * torch.tensor(gamma_json[name], dtype=computeSVD_dtype)
+                    else:
+                        gamma = torch.tensor(gamma_json[name], dtype=computeSVD_dtype)
                     
                 W=module.weight.data.detach()
                 us_quan, vt_quan, us_absmax, vt_absmax, tuple_info = DOBI_quantize(W, int(gamma), code = None)
@@ -317,6 +371,12 @@ if __name__ == "__main__":
         default=False,
         help="whether to use remaping to save model",
     )
+    parser.add_argument('--weight_update', choices=['ipca', 'gram'], default='ipca',
+                        help='Weight reconstruction method')
+    parser.add_argument('--fixed_rank_ratio', type=float, default=None,
+                        help='Use one target storage ratio for Gram mode without trained ranks')
+    parser.add_argument('--seq_len', type=int, default=2048,
+                        help='Calibration sequence length when using --fixed_rank_ratio')
     
 #==========================================================================    
     # Settings related to the Path.
@@ -337,7 +397,7 @@ if __name__ == "__main__":
     parser.add_argument(
         '--training_result_path',
         type=str,
-        required=True,
+        default=None,
         help='name of the k json'
     )
 

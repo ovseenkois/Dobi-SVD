@@ -237,6 +237,50 @@ The updated model will be saved in [./results/compressed_model/].  After that yo
 
 
 
+### Experimental activation-Gram weight update
+
+`weight_updater.py` also supports a Gram-based alternative to IPCA. For every
+compressible linear layer it runs the **unmodified** model over the calibration
+samples and accumulates the uncentered output Gram matrix
+`C = sum(A.T @ A)` in CPU float32, where `A` contains the linear output vectors
+of the layer (bias excluded). The leading `k` eigenvectors of `C` form an output-space basis `V`.
+For PyTorch weights shaped `[out_features, in_features]`, the updated weight is
+`V @ (V.T @ weight)`. The standard no-remapping output uses exact two-factor
+layers, so it does not introduce another approximate SVD.
+
+Use trained ranks from the same `best_gamma.json` as the IPCA run:
+
+```bash
+python weight_updater.py \
+  --model_id meta-llama/Llama-3.2-1B \
+  --training_result_path YOUR_TRAINING_RESULT_DIRECTORY \
+  --weight_update gram --n_train_samples 32
+```
+
+For an initial experiment without rank training, choose a fixed target storage
+ratio. With `--remapping`, rank is `ceil(ratio * min(in, out))`; without it,
+rank is `ceil(ratio * in * out / (in + out))`. These are per-matrix targets, so
+the whole-model ratio can differ because some layers remain uncompressed.
+
+```bash
+python weight_updater.py \
+  --model_id meta-llama/Llama-3.2-1B \
+  --weight_update gram --fixed_rank_ratio 0.6 \
+  --training_dataset wikitext2 --seq_len 2048 \
+  --n_train_samples 32 --n_eval_samples 16
+```
+
+Add `--remapping` for the remapped storage format. Gram outputs use separate
+`DobiGram...` directories and can be evaluated with the existing `evaluate.py`
+command, adding `--remapping` to evaluation when appropriate. For a fair IPCA
+comparison, use the same trained ranks, calibration seed, samples, and storage
+format. The Gram pass uses original-model activations; the IPCA pass in this
+repository propagates truncated activations, so their calibration inputs differ.
+
+The CPU accumulators require roughly `4 * sum(out_features**2)` bytes. For
+Llama 3.2 1B this can be several gigabytes. Gram eigendecomposition also needs
+temporary GPU memory, especially for the 8192-dimensional FFN outputs.
+
 ## Important Modules
 
 In addition to the above-mentioned Dobi-SVD implementation, our work also includes some important modules. For your convenience, we have separated them into separate files, including:

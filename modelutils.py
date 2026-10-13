@@ -51,6 +51,8 @@ def load_remapping_model(updated_model_path):
 
 
 def load_unremapping_model(model_id):
-    pruned_dict = torch.load(f"{model_id}/DobiSVD_Model.pt") #, map_location='cuda'
+    # This repository saves a complete model object, including custom layers.
+    # Only load checkpoints created locally or obtained from a trusted source.
+    pruned_dict = torch.load(f"{model_id}/DobiSVD_Model.pt", weights_only=False)
     tokenizer, model = pruned_dict['tokenizer'], pruned_dict['model']
     return model, tokenizer

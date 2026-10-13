@@ -3,6 +3,28 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim import Adam
 
+
+class ProjectedLinear(nn.Module):
+    """Exact two-factor form of an output-space projected nn.Linear."""
+
+    def __init__(self, linear, basis, name=None):
+        super().__init__()
+        if name is not None:
+            self.name = name
+        rank = basis.shape[1]
+        self.ALinear = nn.Linear(linear.in_features, rank, bias=False,
+                                 device=linear.weight.device, dtype=linear.weight.dtype)
+        self.BLinear = nn.Linear(rank, linear.out_features, bias=linear.bias is not None,
+                                 device=linear.weight.device, dtype=linear.weight.dtype)
+        with torch.no_grad():
+            self.ALinear.weight.copy_(basis.T @ linear.weight)
+            self.BLinear.weight.copy_(basis)
+            if linear.bias is not None:
+                self.BLinear.bias.copy_(linear.bias)
+
+    def forward(self, x):
+        return self.BLinear(self.ALinear(x))
+
 class SVDTransformLayer(nn.Module):
     def __init__(self,gamma=None, weight = None, bias = None, name = None, device = None):
         super(SVDTransformLayer, self).__init__()
